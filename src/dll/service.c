@@ -58,6 +58,85 @@ BOOL WINAPI FspServiceConsoleCtrlHandler(DWORD CtrlType);
     (FSP_SERVICE *)((PUINT8)FspServiceTable[0].lpServiceName - FIELD_OFFSET(FSP_SERVICE, ServiceName)) :\
     0)
 
+/** Returns null if exactly match, or a pointer to the lower code found where mismatched.
+* The lower code may point to a 0 byte where the one string is a substring of the other.
+* The number of bytes in the failing string can be deduced to determine a common substring where desired.
+* 
+* You may deduce from this that I am more interested in common substring detection than sorting.
+*/
+PCWSTR wcsmatch(PCWSTR lhs, PCWSTR rhs)
+{
+    if (!lhs)
+        return rhs;
+    if (!rhs)
+        return lhs;
+           
+    while (*lhs == *rhs)
+    {
+        lhs++;
+        rhs++;
+    }
+    if (!*lhs && !*rhs)
+        return NULL;
+
+    if (*lhs < *rhs)
+        return lhs;
+    else
+        return rhs;
+}
+
+/** Returns negative if exactly match, or a count to the code found where mismatched.
+* One code may point to a 0 byte where the one string is a substring of the other.
+*
+* You may deduce from this that I am more interested in common substring detection than sorting.
+*/
+
+long long int wcsmatchcount(PCWSTR lhs, PCWSTR rhs)
+{
+    if (!lhs)
+        if (!rhs)
+            return -2;
+        else
+            return 0;
+    if (!rhs)
+        return 0;
+
+    long long int count = 0;
+    while (*lhs == *rhs)
+    {
+        lhs++;
+        rhs++;
+        count++;
+    }
+    if (!*lhs && !*rhs)
+        return -1;
+    else
+        return count;
+}
+/**
+ * @brief Identify the service from argv[0] name (which must be unique across the registered drivers)
+ * Note this needs a rewrite (already) if the drivers are registered individually using "debug fallback"
+ *
+ * @param FindServiceName 
+ * @return 
+ */
+FSP_SERVICE* FspServiceFromTableFind(PCWSTR FindServiceName)
+{
+    if (!FspServiceTable)
+        return NULL;
+
+    SERVICE_TABLE_ENTRYW* p;
+
+    // Todo: optimise - if first entry is a prefix of ServiceName, and second entry is a longer prefix, assume they are all prefixes to save some compares.
+
+    for (p = FspServiceTable; p[0].lpServiceProc; p++)
+        if (wcsmatch(FindServiceName, p[0].lpServiceName) == NULL)
+            return (FSP_SERVICE*)((PUINT8)p[0].lpServiceName - FIELD_OFFSET(FSP_SERVICE, ServiceName));
+    return NULL;
+}
+
+
+
 VOID FspServiceFinalize(BOOLEAN Dynamic)
 {
     /*
@@ -71,6 +150,17 @@ VOID FspServiceFinalize(BOOLEAN Dynamic)
         CloseHandle(FspServiceConsoleModeEvent);
 }
 
+/** TODO Main entrypoint to launch a service. But want to launch an array of services.
+eg
+FSP_API ULONG FspServiceRunArrayEx(PWSTR *ServiceName, size_t ServiceNameCount,
+    FSP_SERVICE_START *OnStart,
+    FSP_SERVICE_STOP *OnStop,
+    FSP_SERVICE_CONTROL *OnControl,
+    PVOID UserContext)
+
+Also FspServiceCreate needs update.
+
+*/
 FSP_API ULONG FspServiceRunEx(PWSTR ServiceName,
     FSP_SERVICE_START *OnStart,
     FSP_SERVICE_STOP *OnStop,
@@ -91,7 +181,7 @@ FSP_API ULONG FspServiceRunEx(PWSTR ServiceName,
     Service->UserContext = UserContext;
 
     FspServiceAllowConsoleMode(Service);
-    Result = FspServiceLoop(Service);
+    Result = FspServiceLoop(Service, 1);
     ExitCode = FspServiceGetExitCode(Service);
     FspServiceDelete(Service);
 
@@ -220,7 +310,7 @@ FSP_API ULONG FspServiceGetExitCode(FSP_SERVICE *Service)
     return Service->ServiceStatus.dwWin32ExitCode;
 }
 
-FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
+FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service, size_t count)
 {
     /*
      * FspServiceLoop can only be called once per process, because of StartServiceCtrlDispatcherW
@@ -231,21 +321,26 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
     AcquireSRWLockExclusive(&FspServiceLoopLock);
 
     NTSTATUS Result;
-    SERVICE_TABLE_ENTRYW ServiceTable[2];
+    SERVICE_TABLE_ENTRYW* ServiceTable = MemAlloc(sizeof(SERVICE_TABLE_ENTRYW)*(count+1));
+    // SERVICE_TABLE_ENTRYW ServiceTable[2];
+    size_t i;
+    for (i = 0; i < count; i++)
+    {
+        
+        Service[i].ExitCode = NO_ERROR;
+        Service[i].ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+        Service[i].ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+        Service[i].ServiceStatus.dwControlsAccepted = 0;
+        Service[i].ServiceStatus.dwWin32ExitCode = NO_ERROR;
+        Service[i].ServiceStatus.dwServiceSpecificExitCode = 0;
+        Service[i].ServiceStatus.dwCheckPoint = 0;
+        Service[i].ServiceStatus.dwWaitHint = 0;
 
-    Service->ExitCode = NO_ERROR;
-    Service->ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-    Service->ServiceStatus.dwCurrentState = SERVICE_STOPPED;
-    Service->ServiceStatus.dwControlsAccepted = 0;
-    Service->ServiceStatus.dwWin32ExitCode = NO_ERROR;
-    Service->ServiceStatus.dwServiceSpecificExitCode = 0;
-    Service->ServiceStatus.dwCheckPoint = 0;
-    Service->ServiceStatus.dwWaitHint = 0;
-
-    ServiceTable[0].lpServiceName = Service->ServiceName;
-    ServiceTable[0].lpServiceProc = FspServiceEntry;
-    ServiceTable[1].lpServiceName = 0;
-    ServiceTable[1].lpServiceProc = 0;
+        ServiceTable[i].lpServiceName = Service->ServiceName; // we can get back to service via a C++ style static cast.
+        ServiceTable[i].lpServiceProc = FspServiceEntry;
+    }
+    ServiceTable[count].lpServiceName = 0;
+    ServiceTable[count].lpServiceProc = 0;
     AcquireSRWLockExclusive(&FspServiceTableLock);
     FspServiceTable = ServiceTable;
     ReleaseSRWLockExclusive(&FspServiceTableLock);
@@ -258,65 +353,70 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
         DWORD WaitResult;
         DWORD LastError;
 
-        LastError = GetLastError();
-        if (!Service->AllowConsoleMode || ERROR_FAILED_SERVICE_CONTROLLER_CONNECT != LastError)
+        for (i = 0; i < count; i++)
         {
-            Result = FspNtStatusFromWin32(LastError);
-            goto exit;
-        }
-
-        /* ENTER CONSOLE MODE! */
-
-        /* create the console mode event and console control handler */
-        if (0 == FspServiceConsoleModeEvent)
-        {
+            //  TODO: This loop is not completed. I think I want to go back to using multiple threads for the debug fallback mode!
             FspServiceConsoleModeEvent = CreateEventW(0, TRUE, FALSE, 0);
+            LastError = GetLastError();
+            if (!Service[i].AllowConsoleMode || ERROR_FAILED_SERVICE_CONTROLLER_CONNECT != LastError)
+            {
+                Result = FspNtStatusFromWin32(LastError);
+                goto exit;
+            }
+
+            /* ENTER CONSOLE MODE! */
+
+            /* create the console mode event and console control handler */
             if (0 == FspServiceConsoleModeEvent)
             {
+
+                if (0 == FspServiceConsoleModeEvent)
+                {
+                    Result = FspNtStatusFromWin32(GetLastError());
+                    goto console_mode_exit;
+                }
+
+                if (!SetConsoleCtrlHandler(FspServiceConsoleCtrlHandler, TRUE))
+                {
+                    Result = FspNtStatusFromWin32(GetLastError());
+                    goto console_mode_exit;
+                }
+            }
+    #if 0
+            else
+            {
+                ResetEvent(FspServiceConsoleModeEvent);
+                FspInterlockedStore32((INT32 *)&FspServiceConsoleCtrlHandlerDisabled, 0);
+            }
+    #endif
+
+            /* prepare the command line arguments */
+            Argv = CommandLineToArgvW(GetCommandLineW(), &Argc);
+            if (0 == Argv)
+            {
                 Result = FspNtStatusFromWin32(GetLastError());
                 goto console_mode_exit;
             }
+            Argv[0] = Service[i].ServiceName;
 
-            if (!SetConsoleCtrlHandler(FspServiceConsoleCtrlHandler, TRUE))
+            /* create the console mode startup thread (mimic StartServiceCtrlDispatcherW) */
+            Thread = CreateThread(0, 0, FspServiceConsoleModeThread, Argv/* give ownership */, 0, 0);
+            if (0 == Thread)
+            {
+                LocalFree(Argv);
+                Result = FspNtStatusFromWin32(GetLastError());
+                goto console_mode_exit;
+            }
+            /* wait for the console mode startup thread to terminate */
+            WaitResult = WaitForSingleObject(Thread, INFINITE);
+            CloseHandle(Thread);
+            if (WAIT_OBJECT_0 != WaitResult)
             {
                 Result = FspNtStatusFromWin32(GetLastError());
                 goto console_mode_exit;
             }
         }
-#if 0
-        else
-        {
-            ResetEvent(FspServiceConsoleModeEvent);
-            FspInterlockedStore32((INT32 *)&FspServiceConsoleCtrlHandlerDisabled, 0);
-        }
-#endif
 
-        /* prepare the command line arguments */
-        Argv = CommandLineToArgvW(GetCommandLineW(), &Argc);
-        if (0 == Argv)
-        {
-            Result = FspNtStatusFromWin32(GetLastError());
-            goto console_mode_exit;
-        }
-        Argv[0] = Service->ServiceName;
-
-        /* create the console mode startup thread (mimic StartServiceCtrlDispatcherW) */
-        Thread = CreateThread(0, 0, FspServiceConsoleModeThread, Argv/* give ownership */, 0, 0);
-        if (0 == Thread)
-        {
-            LocalFree(Argv);
-            Result = FspNtStatusFromWin32(GetLastError());
-            goto console_mode_exit;
-        }
-
-        /* wait for the console mode startup thread to terminate */
-        WaitResult = WaitForSingleObject(Thread, INFINITE);
-        CloseHandle(Thread);
-        if (WAIT_OBJECT_0 != WaitResult)
-        {
-            Result = FspNtStatusFromWin32(GetLastError());
-            goto console_mode_exit;
-        }
 
         /* wait until signaled by the console control handler */
         WaitResult = WaitForSingleObject(FspServiceConsoleModeEvent, INFINITE);
@@ -340,6 +440,8 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
         FspInterlockedStore32((INT32 *)&FspServiceConsoleCtrlHandlerDisabled, 1);
     }
 
+    MemFree(Service);
+
     Result = STATUS_SUCCESS;
 
 exit:
@@ -359,7 +461,7 @@ VOID FspServiceStopLoop(VOID)
     HANDLE Thread;
 
     AcquireSRWLockShared(&FspServiceTableLock);
-    HasService = 0 != FspServiceFromTable();
+    HasService = 0 != FspServiceFromTable();    // This is an internal call used by the fuse implementation. It could easily have passed in the Service object, but didn't!
     ReleaseSRWLockShared(&FspServiceTableLock);
 
     if (HasService)
@@ -372,7 +474,7 @@ VOID FspServiceStopLoop(VOID)
 static DWORD WINAPI FspServiceStopLoopThread(PVOID Context)
 {
     AcquireSRWLockShared(&FspServiceTableLock);
-    FSP_SERVICE *Service = FspServiceFromTable();
+    FSP_SERVICE *Service = FspServiceFromTable();    // This is an internal call used by the fuse implementation. It could easily have passed in the Service object via Context, but didn't!
     if (0 != Service)
         FspServiceStop(Service);
     ReleaseSRWLockShared(&FspServiceTableLock);
@@ -435,7 +537,7 @@ static VOID WINAPI FspServiceEntry(DWORD Argc, PWSTR *Argv)
 {
     FSP_SERVICE *Service;
 
-    Service = FspServiceFromTable();
+    Service = FspServiceFromTableFind(Argv ? Argv[0] : NULL);    // PG
         /* we are subordinate to FspServiceLoop; no need to protect this access with FspServiceTableLock */
     if (0 == Service)
     {
@@ -544,7 +646,7 @@ static DWORD WINAPI FspServiceConsoleModeThread(PVOID Context)
     for (Argc = 0; 0 != Argv[Argc]; Argc++)
         ;
 
-    Service = FspServiceFromTable();
+    Service = FspServiceFromTableFind(Argv[0]); // PG
         /* we are subordinate to FspServiceLoop; no need to protect this access with FspServiceTableLock */
     if (0 == Service)
         FspServiceLog(EVENTLOG_ERROR_TYPE,

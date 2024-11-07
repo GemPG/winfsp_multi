@@ -2106,7 +2106,7 @@ FSP_API ULONG FspServiceGetExitCode(FSP_SERVICE *Service);
  * @return
  *     STATUS_SUCCESS or error code.
  */
-FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service);
+FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service, size_t count);
 /**
  * Stops a running service.
  *

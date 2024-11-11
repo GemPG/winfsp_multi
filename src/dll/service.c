@@ -58,6 +58,148 @@ BOOL WINAPI FspServiceConsoleCtrlHandler(DWORD CtrlType);
     (FSP_SERVICE *)((PUINT8)FspServiceTable[0].lpServiceName - FIELD_OFFSET(FSP_SERVICE, ServiceName)) :\
     0)
 
+/** Returns null if exactly match, or a pointer to the lower code found where mismatched.
+* The lower code may point to a 0 byte where the one string is a substring of the other.
+* The number of bytes in the failing string can be deduced to determine a common substring where desired.
+*
+* You may deduce from this that I am more interested in common substring detection than sorting.
+*/
+PCWSTR wcsmatch(PCWSTR lhs, PCWSTR rhs)
+{
+    if (!lhs)
+        return rhs;
+    if (!rhs)
+        return lhs;
+
+    while (*lhs == *rhs)
+    {
+        lhs++;
+        rhs++;
+    }
+    if (!*lhs && !*rhs)
+        return NULL;
+
+    if (*lhs < *rhs)
+        return lhs;
+    else
+        return rhs;
+}
+
+/** Returns negative if exactly match, or a count to the code found where mismatched.
+* One code may point to a 0 byte where the one string is a substring of the other.
+*
+* You may deduce from this that I am more interested in common substring detection than sorting.
+*/
+
+long long int wcsmatchcount(PCWSTR lhs, PCWSTR rhs)
+{
+    if (!lhs)
+        if (!rhs)
+            return -2;
+        else
+            return 0;
+    if (!rhs)
+        return 0;
+
+    long long int count = 0;
+    while (*lhs == *rhs)
+    {
+        lhs++;
+        rhs++;
+        count++;
+    }
+    if (!*lhs && !*rhs)
+        return -1;
+    else
+        return count;
+}
+
+
+struct RegisteredServices
+{   // TODO: Needs a mutex!
+    FSP_SERVICE** RegisteredServices;
+    size_t ActiveServices, UsedServices, CapacityServices;
+} theRegisteredServices = { 0 };
+
+FSP_SERVICE* FindService(wchar_t* serviceName)
+{
+    if (!theRegisteredServices.RegisteredServices)
+        return NULL;
+    size_t index;
+    for (index = 0; index < theRegisteredServices.UsedServices; index++)
+        if (theRegisteredServices.RegisteredServices[index])
+        {
+            if (wcsmatch(theRegisteredServices.RegisteredServices[index]->ServiceName, serviceName) == NULL)
+                return theRegisteredServices.RegisteredServices[index];
+        }
+    return NULL;
+}
+/** Add the service to the known services list.
+* If the list canno
+ @return index for new service (+ve)
+ @return allocation error -1U
+ @return repeated -2U
+
+*/
+size_t RegisterService(FSP_SERVICE* newService)
+{
+    // TODO: Needs a mutex!
+    enum {START_FACTOR =  2, GROW_FACTOR_64 = 20 };
+    if (theRegisteredServices.ActiveServices == theRegisteredServices.CapacityServices)
+    {   // Realloc
+        size_t newsize = theRegisteredServices.CapacityServices ? (theRegisteredServices.CapacityServices * GROW_FACTOR_64) / 64 : START_FACTOR;
+        FSP_SERVICE** newRegisteredServices = MemAlloc(newsize * sizeof(theRegisteredServices.RegisteredServices[0]));
+        if (!newRegisteredServices)
+            return -1U;
+        if (theRegisteredServices.CapacityServices)
+        {
+            // Sadly no realloc method, so:
+            memcpy(newRegisteredServices, theRegisteredServices.RegisteredServices, theRegisteredServices.CapacityServices * sizeof(theRegisteredServices.RegisteredServices[0]));
+            void* oldServices = theRegisteredServices.RegisteredServices;
+            theRegisteredServices.RegisteredServices = newRegisteredServices;
+            MemFree(oldServices);
+        }
+        theRegisteredServices.CapacityServices = newsize;
+    }
+    if (theRegisteredServices.UsedServices == theRegisteredServices.CapacityServices)
+    {   // find an unused slot
+        size_t index;
+        for (index = 0; index < theRegisteredServices.UsedServices; index++)
+            if (theRegisteredServices.RegisteredServices[index] == NULL)
+            {
+                theRegisteredServices.RegisteredServices[index] = newService;
+                theRegisteredServices.ActiveServices++;
+                return index;
+            }
+        // Should not get here!
+        // assert(!"Should not get here!");
+        return -1U;
+    }
+    else
+    {   // append to slots
+        theRegisteredServices.RegisteredServices[theRegisteredServices.UsedServices++] = newService;
+        return theRegisteredServices.ActiveServices++;
+    }
+
+
+}
+
+size_t UnRegisterService(FSP_SERVICE* oldService)
+{
+    size_t index;
+    for (index = 0; index < theRegisteredServices.UsedServices; index++)
+        if (theRegisteredServices.RegisteredServices[index] == oldService)
+        {
+            theRegisteredServices.ActiveServices--;
+            if (index == theRegisteredServices.UsedServices - 1)
+                theRegisteredServices.UsedServices--;
+            theRegisteredServices.RegisteredServices[index] = NULL;
+            return index;
+        }       
+    return -1U;
+}
+
+
 VOID FspServiceFinalize(BOOLEAN Dynamic)
 {
     /*
@@ -98,7 +240,7 @@ FSP_API ULONG FspServiceRunEx(PWSTR ServiceName,
     if (!NT_SUCCESS(Result))
     {
         FspServiceLog(EVENTLOG_ERROR_TYPE,
-            L"The service %s has failed to run (Status=%lx).", ServiceName, Result);
+            L"The service %s has failed to run, sorry! (Status=%lx).", ServiceName, Result);
         return FspWin32FromNtStatus(Result);
     }
 
@@ -232,6 +374,7 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
 
     NTSTATUS Result;
     SERVICE_TABLE_ENTRYW ServiceTable[2];
+    BOOL TryingConsole = FALSE;
 
     Service->ExitCode = NO_ERROR;
     Service->ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
@@ -252,15 +395,25 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
 
     if (!StartServiceCtrlDispatcherW(ServiceTable))
     {
+        FspServiceLog(EVENTLOG_ERROR_TYPE,
+            L"Could not start the service %s so trying fallback mode! ", Service->ServiceName);        
         HANDLE Thread;
+        TryingConsole = TRUE;
+        ReleaseSRWLockExclusive(&FspServiceLoopLock);   // Once we give up on loading as a service, we don't nee this lock any more.
         PWSTR *Argv;
         DWORD Argc;
         DWORD WaitResult;
         DWORD LastError;
 
         LastError = GetLastError();
-        if (!Service->AllowConsoleMode || ERROR_FAILED_SERVICE_CONTROLLER_CONNECT != LastError)
+        if ( !FspServiceConsoleModeEvent && (!Service->AllowConsoleMode || ERROR_FAILED_SERVICE_CONTROLLER_CONNECT != LastError) )
         {
+            if (!Service->AllowConsoleMode)
+                FspServiceLog(EVENTLOG_ERROR_TYPE,
+                    L"Could not start the service %s but trying fallback mode is not allowed! ", Service->ServiceName); 
+            else
+                FspServiceLog(EVENTLOG_ERROR_TYPE,
+                    L"Could not start the service %s but Status not ERROR_FAILED_SERVICE_CONTROLLER_CONNECT (Status=%lx).", Service->ServiceName, Result);
             Result = FspNtStatusFromWin32(LastError);
             goto exit;
         }
@@ -308,6 +461,8 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
             Result = FspNtStatusFromWin32(GetLastError());
             goto console_mode_exit;
         }
+        FspServiceLog(EVENTLOG_ERROR_TYPE,
+            L"Waiting for the service %s to start! ", Service->ServiceName);  
 
         /* wait for the console mode startup thread to terminate */
         WaitResult = WaitForSingleObject(Thread, INFINITE);
@@ -318,6 +473,8 @@ FSP_API NTSTATUS FspServiceLoop(FSP_SERVICE *Service)
             goto console_mode_exit;
         }
 
+        FspServiceLog(EVENTLOG_ERROR_TYPE,
+            L"Waiting for the service %s loop to exit! ", Service->ServiceName); 
         /* wait until signaled by the console control handler */
         WaitResult = WaitForSingleObject(FspServiceConsoleModeEvent, INFINITE);
         if (WAIT_OBJECT_0 != WaitResult)
@@ -347,7 +504,8 @@ exit:
     FspServiceTable = 0;
     ReleaseSRWLockExclusive(&FspServiceTableLock);
 
-    ReleaseSRWLockExclusive(&FspServiceLoopLock);
+    if (!TryingConsole)
+        ReleaseSRWLockExclusive(&FspServiceLoopLock);
 
     return Result;
 }
